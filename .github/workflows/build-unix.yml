@@ -1,0 +1,143 @@
+# Source of truth for .github/workflows/build-unix.yml in bellowsai/bellows-releases.
+#
+# It is kept here, outside .github/workflows, so this private repository has the
+# history of it without GitHub ever running it from here. Change it here, then
+# copy it over (HANDOVER.md has the command).
+#
+# ---------------------------------------------------------------------------
+#
+# Builds Bellows for macOS and Linux and attaches the installers to a release.
+#
+# WHY IT LIVES IN THE PUBLIC RELEASES REPOSITORY. GitHub-hosted runners are free
+# for public repositories. The private source repository gets 2,000 minutes a
+# month, macOS spends them about ten times faster, and running every platform on
+# every push used September's allowance up by the 14th, which blocked the 1.10.6
+# macOS and Linux builds.
+#
+# WHAT IS PUBLIC. This file and the build logs. The source is checked out with a
+# read-only token and never printed; GitHub masks secrets in logs. Nothing below
+# echoes environment variables or file contents.
+#
+# WHEN IT RUNS. When a release is published -- `npm run release:publish`
+# publishes with a personal token, so the `release` event fires -- or by hand,
+# with a version. Forks can trigger neither, so neither secret is ever handed to
+# anyone else's code.
+#
+# SECRETS ON bellowsai/bellows-releases:
+#   SOURCE_TOKEN        fine-grained token, bellowsai/bellows only, Contents: read-only
+#   UPDATE_SIGNING_KEY  the PEM text of ~/.bellows/update-key.pem
+#
+# The macOS build is ad-hoc signed and Apple Silicon only (see electron-builder.json
+# and HANDOVER.md). Uploads use this repository's own GITHUB_TOKEN.
+name: build-unix
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The released version to build, for example 1.10.6
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-unix-${{ inputs.version || github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: mac
+            manifest: latest-mac.yml
+          - os: ubuntu-latest
+            platform: linux
+            manifest: latest-linux.yml
+    runs-on: ${{ matrix.os }}
+    env:
+      REQUESTED: ${{ inputs.version || github.event.release.tag_name }}
+    steps:
+      - name: Which version
+        id: v
+        run: |
+          v="${REQUESTED#v}"
+          case "$v" in ""|*[!0-9.]*) echo "not a version: '$REQUESTED'"; exit 1 ;; esac
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "tag=v$v" >> "$GITHUB_OUTPUT"
+
+      # The source repository carries no tags -- electron-builder tags this
+      # repository -- so the release is found by the commit `npm run ship`
+      # made for it, and exactly that commit is built.
+      - name: Find the release commit in the source
+        id: src
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: |
+          sha=$(gh api "repos/bellowsai/bellows/commits?sha=main&per_page=100" \
+            --jq '[.[] | select((.commit.message | split("\n")[0]) == "chore: release ${{ steps.v.outputs.version }}")][0].sha // empty')
+          if [ -z "$sha" ]; then echo "no 'chore: release ${{ steps.v.outputs.version }}' commit in the last 100 on main"; exit 1; fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "building source commit ${sha:0:7}"
+
+      - uses: actions/checkout@v7
+        with:
+          repository: bellowsai/bellows
+          ref: ${{ steps.src.outputs.sha }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: source
+          persist-credentials: false
+
+      - name: The release exists and matches the source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          got=$(node -p "require('./source/package.json').version")
+          if [ "$got" != "${{ steps.v.outputs.version }}" ]; then echo "source commit is version $got, expected ${{ steps.v.outputs.version }}"; exit 1; fi
+          draft=$(gh release view "${{ steps.v.outputs.tag }}" --repo "${{ github.repository }}" --json isDraft --jq '.isDraft')
+          if [ "$draft" != "false" ]; then echo "${{ steps.v.outputs.tag }} is not a published release"; exit 1; fi
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+
+      - name: Install
+        working-directory: source
+        run: npm ci
+
+      - name: Tests
+        working-directory: source
+        run: npm test
+
+      - name: Package
+        working-directory: source
+        run: npm run stamp && npx electron-builder --${{ matrix.platform }} --publish never
+
+      - name: Sign the update manifest
+        working-directory: source
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: node scripts/sign-manifest.js dist/${{ matrix.manifest }}
+
+      - name: Attach to the release
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          files=(dist/*.dmg dist/*-mac.zip dist/*.AppImage dist/*.deb dist/*.blockmap dist/${{ matrix.manifest }} dist/${{ matrix.manifest }}.sig)
+          if [ ${#files[@]} -lt 3 ]; then echo "nothing to attach: ${files[*]}"; exit 1; fi
+          gh release upload "${{ steps.v.outputs.tag }}" "${files[@]}" --repo "${{ github.repository }}" --clobber
+
+      - name: An installed copy can see it
+        run: |
+          got=$(curl -fsSL "https://github.com/${{ github.repository }}/releases/download/${{ steps.v.outputs.tag }}/${{ matrix.manifest }}" | sed -n 's/^version: *//p' | tr -d "'\"")
+          if [ "$got" != "${{ steps.v.outputs.version }}" ]; then echo "${{ matrix.manifest }} says '$got', expected ${{ steps.v.outputs.version }}"; exit 1; fi
+          echo "${{ matrix.manifest }} serves ${{ steps.v.outputs.version }}"
