@@ -63,6 +63,26 @@ jobs:
     env:
       REQUESTED: ${{ inputs.version || github.event.release.tag_name }}
     steps:
+      # First, and in plain words: is the source token usable? An empty secret
+      # made gh report "set the GH_TOKEN environment variable", and a wrong one
+      # "Bad credentials" -- both deep inside a later step. Only the length is
+      # printed, never the value.
+      - name: The source token works
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: |
+          if [ -z "$SOURCE_TOKEN" ]; then
+            echo "::error::SOURCE_TOKEN is empty on this repository. Set it under Settings > Secrets and variables > Actions: a fine-grained token owned by bellowsai, for bellowsai/bellows, Contents read-only."
+            exit 1
+          fi
+          code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $SOURCE_TOKEN" -H "Accept: application/vnd.github+json" https://api.github.com/repos/bellowsai/bellows)
+          case "$code" in
+            200) echo "SOURCE_TOKEN (${#SOURCE_TOKEN} characters) can read bellowsai/bellows" ;;
+            401) echo "::error::SOURCE_TOKEN (${#SOURCE_TOKEN} characters) is not a valid token (HTTP 401): it was mistyped, revoked or expired."; exit 1 ;;
+            403|404) echo "::error::SOURCE_TOKEN is a valid token but cannot see bellowsai/bellows (HTTP $code): check it is owned by bellowsai and has that repository selected, Contents read-only."; exit 1 ;;
+            *) echo "::error::checking SOURCE_TOKEN returned HTTP $code"; exit 1 ;;
+          esac
+
       - name: Which version
         id: v
         run: |
