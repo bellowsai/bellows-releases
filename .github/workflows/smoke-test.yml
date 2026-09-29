@@ -1,0 +1,236 @@
+# Source of truth for .github/workflows/smoke-test.yml in bellowsai/bellows-releases.
+#
+# Kept here, outside .github/workflows, like build-unix.yml, so this private
+# repository has its history without GitHub running it from here. Change it
+# here, then copy it and smoke/probe.mjs over.
+#
+# ---------------------------------------------------------------------------
+#
+# Installs a PUBLISHED release on clean macOS and Linux machines, the way a user
+# would, launches it, and looks at it. Bellows is developed on Windows, and
+# build-unix.yml only proves the installers build and the tests pass there; this
+# proves the installed app opens.
+#
+#   mac        dmg -> /Applications. Gatekeeper's verdict on a downloaded copy,
+#              then launch. Then 1.11.2 installed, to see it offer the newer
+#              release (a Mac updates through the download page by design).
+#   deb        apt install on Ubuntu 24.04 with the desktop's AppArmor setting,
+#              plus the dependency list checked in a bare ubuntu:24.04 container.
+#              Then 1.11.2, to see it download and verify an update.
+#   appimage   Run as downloaded on Ubuntu 24.04 with the desktop's AppArmor
+#              setting. Then 1.11.2, updated for real, and the result relaunched.
+#
+# WHAT IS PUBLIC. This file, probe.mjs and the logs. It uses no secrets: it
+# downloads the public release assets and nothing else. Manual runs only.
+#
+# Screenshots, app logs and one JSON result per launch are uploaded as the
+# `smoke-<job>` artifacts, kept 14 days. The run summary has the verdicts.
+name: smoke-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release to test, for example 1.11.4
+        required: true
+      from_version:
+        description: An older release to update from
+        required: true
+        default: 1.11.2
+
+permissions:
+  contents: read
+
+env:
+  V: ${{ inputs.version }}
+  FROM: ${{ inputs.from_version }}
+  REL: https://github.com/${{ github.repository }}/releases/download
+
+jobs:
+  mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with: { node-version: 24 }
+      - name: Machine
+        run: sw_vers; uname -m
+
+      - name: Install ${{ inputs.version }} from the dmg
+        run: |
+          curl -fsSL -o bellows.dmg "$REL/v$V/Bellows-$V-arm64.dmg"
+          mnt=$(hdiutil attach -nobrowse -noautoopen bellows.dmg | awk -F'\t' '/\/Volumes\//{print $NF}')
+          cp -R "$mnt/Bellows.app" /Applications/
+          hdiutil detach "$mnt" -quiet
+          file /Applications/Bellows.app/Contents/MacOS/Bellows
+
+      - name: Gatekeeper on a downloaded copy
+        run: |
+          # A browser download carries this attribute; curl does not, so add it.
+          xattr -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");Safari;$(uuidgen)" /Applications/Bellows.app
+          {
+            echo "### macOS Gatekeeper"
+            echo '```'
+            echo "\$ codesign --verify --deep --strict"
+            codesign --verify --deep --strict -vv /Applications/Bellows.app 2>&1 || true
+            echo "\$ codesign -dv"
+            codesign -dv /Applications/Bellows.app 2>&1 | grep -E 'Signature|TeamIdentifier|flags' || true
+            echo "\$ spctl --assess (what a double-click decides)"
+            spctl --assess -vv --type exec /Applications/Bellows.app 2>&1 || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          # What "Open Anyway" in Privacy & Security amounts to.
+          xattr -dr com.apple.quarantine /Applications/Bellows.app
+
+      - name: Launch ${{ inputs.version }}
+        run: |
+          mkdir -p out
+          /Applications/Bellows.app/Contents/MacOS/Bellows --remote-debugging-port=9222 > out/mac-app.log 2>&1 &
+          echo $! > app.pid
+          node .github/smoke/probe.mjs --label mac --out out --version "$V" --update current --update-wait 60
+      - name: Screen
+        if: always()
+        run: screencapture -x out/mac-screen.png || true
+      - name: Quit
+        if: always()
+        run: kill "$(cat app.pid)" 2>/dev/null || true; sleep 3; pkill -f /Applications/Bellows.app || true; sleep 2
+
+      - name: ${{ inputs.from_version }} offers ${{ inputs.version }}
+        run: |
+          rm -rf /Applications/Bellows.app
+          curl -fsSL -o old.dmg "$REL/v$FROM/Bellows-$FROM-arm64.dmg"
+          mnt=$(hdiutil attach -nobrowse -noautoopen old.dmg | awk -F'\t' '/\/Volumes\//{print $NF}')
+          cp -R "$mnt/Bellows.app" /Applications/
+          hdiutil detach "$mnt" -quiet
+          /Applications/Bellows.app/Contents/MacOS/Bellows --remote-debugging-port=9222 > out/mac-update-app.log 2>&1 &
+          echo $! > app.pid
+          node .github/smoke/probe.mjs --label mac-update --out out --version "$FROM" --update available --update-wait 90
+          node -e "const r=require('./out/mac-update.json'); if (r.update?.info?.version !== process.env.V) { console.log('offered', r.update?.info?.version, 'expected', process.env.V); process.exit(1) }"
+      - name: Quit
+        if: always()
+        run: kill "$(cat app.pid)" 2>/dev/null || true; pkill -f /Applications/Bellows.app || true
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with: { name: smoke-mac, path: out, retention-days: 14 }
+
+  deb:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with: { node-version: 24 }
+      - name: Desktop conditions
+        run: |
+          # Ubuntu 24.04 desktop restricts unprivileged user namespaces, which
+          # Electron's sandbox falls back on. The runner image does not; match
+          # the desktop.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb > /dev/null
+
+      - name: Dependencies resolve on a bare Ubuntu 24.04
+        run: |
+          curl -fsSL -o bellows.deb "$REL/v$V/bellows_${V}_amd64.deb"
+          dpkg-deb -f bellows.deb Depends
+          docker run --rm -v "$PWD:/w" ubuntu:24.04 bash -c '
+            apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq /w/bellows.deb > /tmp/apt.log 2>&1 || { tail -30 /tmp/apt.log; exit 1; }
+            missing=$(ldd /opt/Bellows/bellows | grep "not found" || true)
+            if [ -n "$missing" ]; then echo "libraries the package does not pull in:"; echo "$missing"; exit 1; fi
+            echo "installed cleanly; every library resolves"'
+
+      - name: Install ${{ inputs.version }} and launch
+        run: |
+          mkdir -p out
+          sudo apt-get install -y -qq ./bellows.deb > /dev/null
+          ls -l /opt/Bellows/chrome-sandbox
+          ls /etc/apparmor.d | grep -i bellows || echo "no AppArmor profile installed"
+          xvfb-run -a -s "-screen 0 1440x900x24" bellows --remote-debugging-port=9222 > out/deb-app.log 2>&1 &
+          node .github/smoke/probe.mjs --label deb --out out --version "$V" --update current --update-wait 60 || { echo "--- app log"; cat out/deb-app.log; exit 1; }
+      - name: Quit
+        if: always()
+        run: pkill -f /opt/Bellows/bellows || true; sleep 3
+
+      - name: ${{ inputs.from_version }} downloads and verifies ${{ inputs.version }}
+        run: |
+          curl -fsSL -o old.deb "$REL/v$FROM/bellows_${FROM}_amd64.deb"
+          sudo apt-get install -y -qq --allow-downgrades ./old.deb > /dev/null
+          xvfb-run -a -s "-screen 0 1440x900x24" bellows --remote-debugging-port=9222 > out/deb-update-app.log 2>&1 &
+          node .github/smoke/probe.mjs --label deb-update --out out --version "$FROM" --update ready --update-wait 300 || { echo "--- app log"; tail -40 out/deb-update-app.log; exit 1; }
+      - name: Quit
+        if: always()
+        run: pkill -f /opt/Bellows/bellows || true
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with: { name: smoke-deb, path: out, retention-days: 14 }
+
+  appimage:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with: { node-version: 24 }
+      - name: Desktop conditions
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb > /dev/null
+          # A fresh Ubuntu 22.04+ desktop does not have libfuse2, which the
+          # AppImage runtime loads. Say whether this machine does.
+          if ldconfig -p | grep -q 'libfuse\.so\.2'; then echo "libfuse2: present"; else echo "libfuse2: ABSENT"; fi | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Launch ${{ inputs.version }} as downloaded
+        id: plain
+        continue-on-error: true
+        run: |
+          mkdir -p out app
+          curl -fsSL -o "app/Bellows-$V.AppImage" "$REL/v$V/Bellows-$V.AppImage"
+          chmod +x "app/Bellows-$V.AppImage"
+          xvfb-run -a -s "-screen 0 1440x900x24" "app/Bellows-$V.AppImage" --remote-debugging-port=9222 > out/appimage-app.log 2>&1 &
+          node .github/smoke/probe.mjs --label appimage --out out --version "$V" --update current --update-wait 60 || { echo "--- app log"; cat out/appimage-app.log; exit 1; }
+      - name: Quit
+        if: always()
+        run: pkill -f '\.AppImage' || true; pkill -f '/tmp/\.mount_' || true; sleep 3
+
+      - name: If that failed, is it the sandbox?
+        if: steps.plain.outcome == 'failure'
+        run: |
+          xvfb-run -a -s "-screen 0 1440x900x24" "app/Bellows-$V.AppImage" --no-sandbox --remote-debugging-port=9222 > out/appimage-nosandbox-app.log 2>&1 &
+          if node .github/smoke/probe.mjs --label appimage-nosandbox --out out --version "$V"; then
+            echo "AppImage opens only with --no-sandbox on Ubuntu 24.04 desktop settings" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          pkill -f '\.AppImage' || true; pkill -f '/tmp/\.mount_' || true; sleep 3
+
+      - name: ${{ inputs.from_version }} updates itself to ${{ inputs.version }}
+        id: update
+        run: |
+          rm -rf app && mkdir app
+          curl -fsSL -o "app/Bellows-$FROM.AppImage" "$REL/v$FROM/Bellows-$FROM.AppImage"
+          chmod +x "app/Bellows-$FROM.AppImage"
+          # Same flags as whichever launch worked above, so the update is what is under test.
+          flags=""; [ "${{ steps.plain.outcome }}" = failure ] && flags="--no-sandbox"
+          xvfb-run -a -s "-screen 0 1440x900x24" "app/Bellows-$FROM.AppImage" $flags --remote-debugging-port=9222 > out/appimage-update-app.log 2>&1 &
+          node .github/smoke/probe.mjs --label appimage-update --out out --version "$FROM" --update ready --update-wait 300 --install || { echo "--- app log"; tail -40 out/appimage-update-app.log; exit 1; }
+          # quitAndInstall replaces the file and relaunches it; give it time, then stop the relaunch.
+          sleep 25
+          pkill -f '\.AppImage' || true; pkill -f '/tmp/\.mount_' || true; sleep 3
+          ls -l app
+          echo "flags=$flags" >> "$GITHUB_OUTPUT"
+      - name: The updated copy is ${{ inputs.version }}
+        run: |
+          img=$(ls -t app/*.AppImage | head -1)
+          echo "launching $img"
+          xvfb-run -a -s "-screen 0 1440x900x24" "$img" ${{ steps.update.outputs.flags }} --remote-debugging-port=9222 > out/appimage-updated-app.log 2>&1 &
+          node .github/smoke/probe.mjs --label appimage-updated --out out --version "$V" || { echo "--- app log"; cat out/appimage-updated-app.log; exit 1; }
+      - name: Quit
+        if: always()
+        run: pkill -f '\.AppImage' || true; pkill -f '/tmp/\.mount_' || true
+
+      - name: Fail if the plain launch failed
+        if: steps.plain.outcome == 'failure'
+        run: echo "::error::The AppImage does not open as downloaded on Ubuntu 24.04 desktop settings"; exit 1
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with: { name: smoke-appimage, path: out, retention-days: 14 }
