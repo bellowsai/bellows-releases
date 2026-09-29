@@ -27,8 +27,15 @@
 #   SOURCE_TOKEN        fine-grained token, bellowsai/bellows only, Contents: read-only
 #   UPDATE_SIGNING_KEY  the PEM text of ~/.bellows/update-key.pem
 #
-# The macOS build is ad-hoc signed and Apple Silicon only (see electron-builder.json
-# and HANDOVER.md). Uploads use this repository's own GITHUB_TOKEN.
+#   MAC_CERT_P12        base64 of the Developer ID Application .p12
+#   MAC_CERT_PASSWORD   its password
+#   APPLE_API_KEY_P8    text of the App Store Connect API key (.p8), for notarising
+#   APPLE_API_KEY_ID    that key's ID
+#   APPLE_API_ISSUER    its issuer ID
+#
+# The macOS build is Developer ID signed, notarised and Apple Silicon only (see
+# electron-builder.json and docs/RELEASING.md). Uploads use this repository's
+# own GITHUB_TOKEN.
 name: build-unix
 
 on:
@@ -136,9 +143,61 @@ jobs:
         working-directory: source
         run: npm test
 
+      # macOS: signed with the Developer ID and notarised, so a download opens
+      # without "Open Anyway" and an update keeps the app's identity -- ad-hoc
+      # builds each had a new one, and macOS asked for the login password to
+      # let every update read the app's own keychain item. Refuses to build
+      # without the secrets: an unsigned arm64 app does not open at all.
+      - name: Signing and notarisation credentials
+        if: matrix.platform == 'mac'
+        env:
+          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          missing=""
+          for n in MAC_CERT_P12 MAC_CERT_PASSWORD APPLE_API_KEY_P8 APPLE_API_KEY_ID APPLE_API_ISSUER; do
+            [ -n "${!n}" ] || missing="$missing $n"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing secrets on this repository:$missing. See docs/RELEASING.md, 'macOS signing'."
+            exit 1
+          fi
+          # Secrets piped from files can carry a trailing newline; $GITHUB_ENV
+          # takes one line per variable.
+          MAC_CERT_PASSWORD=$(printf '%s' "$MAC_CERT_PASSWORD" | tr -d '\r\n')
+          APPLE_API_KEY_ID=$(printf '%s' "$APPLE_API_KEY_ID" | tr -d '\r\n ')
+          APPLE_API_ISSUER=$(printf '%s' "$APPLE_API_ISSUER" | tr -d '\r\n ')
+          MAC_CERT_P12=$(printf '%s' "$MAC_CERT_P12" | tr -d '\r\n ')
+          key="$RUNNER_TEMP/apple-api-key.p8"
+          printf '%s\n' "$APPLE_API_KEY_P8" > "$key"
+          # electron-builder takes CSC_LINK as base64 and APPLE_API_KEY as a path.
+          {
+            echo "CSC_LINK=$MAC_CERT_P12"
+            echo "CSC_KEY_PASSWORD=$MAC_CERT_PASSWORD"
+            echo "APPLE_API_KEY=$key"
+            echo "APPLE_API_KEY_ID=$APPLE_API_KEY_ID"
+            echo "APPLE_API_ISSUER=$APPLE_API_ISSUER"
+          } >> "$GITHUB_ENV"
+
       - name: Package
         working-directory: source
         run: npm run stamp && npx electron-builder --${{ matrix.platform }} --publish never
+
+      - name: Signed by the Developer ID, notarised, and Gatekeeper opens it
+        if: matrix.platform == 'mac'
+        working-directory: source
+        run: |
+          app=$(ls -d dist/mac-arm64/*.app | head -1)
+          codesign --verify --deep --strict "$app"
+          codesign -dv "$app" 2>&1 | grep -E '^(Authority|TeamIdentifier)=' | head -3
+          if codesign -dv "$app" 2>&1 | grep -q 'Signature=adhoc'; then echo "::error::the app is ad-hoc signed"; exit 1; fi
+          xcrun stapler validate "$app"
+          spctl --assess --type exec -vv "$app"
+          dmg=$(ls dist/*.dmg | head -1)
+          spctl --assess --type open --context context:primary-signature -vv "$dmg" || echo "::warning::the dmg itself is not notarised; the app inside is"
 
       - name: Sign the update manifest
         working-directory: source
