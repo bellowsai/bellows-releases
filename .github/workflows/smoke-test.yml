@@ -11,9 +11,9 @@
 # build-unix.yml only proves the installers build and the tests pass there; this
 # proves the installed app opens.
 #
-#   mac        dmg -> /Applications. Gatekeeper's verdict on a downloaded copy,
-#              then launch. Then 1.11.2 installed, to see it offer the newer
-#              release (a Mac updates through the download page by design).
+#   mac        The older release from its dmg, which must offer the newer one (a
+#              Mac updates through the download page by design); then the newer
+#              dmg dragged over it, Gatekeeper's verdict, and launch.
 #   deb        apt install on Ubuntu 24.04 with the desktop's AppArmor setting,
 #              plus the dependency list checked in a bare ubuntu:24.04 container.
 #              Then 1.11.2, to see it download and verify an update.
@@ -55,17 +55,40 @@ jobs:
       - uses: actions/setup-node@v7
         with: { node-version: 24 }
       - name: Machine
-        run: sw_vers; uname -m
+        run: sw_vers; uname -m; mkdir -p out
 
-      - name: Install ${{ inputs.version }} from the dmg
+      # In the order a user lives it: an older copy, told about the new one,
+      # replaced by dragging the new app over it, then opened.
+      - name: Install ${{ inputs.from_version }} from the dmg
+        run: |
+          curl -fsSL -o old.dmg "$REL/v$FROM/Bellows-$FROM-arm64.dmg"
+          mnt=$(hdiutil attach -nobrowse -noautoopen old.dmg | awk -F'	' '/\/Volumes\//{print $NF}')
+          cp -R "$mnt/Bellows.app" /Applications/
+          hdiutil detach "$mnt" -quiet
+      - name: ${{ inputs.from_version }} opens and offers ${{ inputs.version }}
+        run: |
+          /Applications/Bellows.app/Contents/MacOS/Bellows --remote-debugging-port=9222 > out/mac-old-app.log 2>&1 &
+          node .github/smoke/probe.mjs --label mac-old --out out --version "$FROM" --update available --update-wait 90
+          node -e "const r=require('./out/mac-old.json'); if (r.update?.info?.version !== process.env.V) { console.log('offered', r.update?.info?.version, 'expected', process.env.V); process.exit(1) }"
+      - name: Quit
+        if: always()
+        run: |
+          screencapture -x out/mac-old-screen.png || true
+          pkill -f /Applications/Bellows.app || true; sleep 3
+
+      - name: Replace it with ${{ inputs.version }} from the dmg
+        if: always()
         run: |
           curl -fsSL -o bellows.dmg "$REL/v$V/Bellows-$V-arm64.dmg"
-          mnt=$(hdiutil attach -nobrowse -noautoopen bellows.dmg | awk -F'\t' '/\/Volumes\//{print $NF}')
+          mnt=$(hdiutil attach -nobrowse -noautoopen bellows.dmg | awk -F'	' '/\/Volumes\//{print $NF}')
+          # What Finder's "Replace" does: the old bundle goes, the new one is copied in.
+          rm -rf /Applications/Bellows.app
           cp -R "$mnt/Bellows.app" /Applications/
           hdiutil detach "$mnt" -quiet
           file /Applications/Bellows.app/Contents/MacOS/Bellows
 
       - name: Gatekeeper on a downloaded copy
+        if: always()
         run: |
           # A browser download carries this attribute; curl does not, so add it.
           xattr -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");Safari;$(uuidgen)" /Applications/Bellows.app
@@ -73,7 +96,7 @@ jobs:
             echo "### macOS Gatekeeper"
             echo '```'
             echo "\$ codesign --verify --deep --strict"
-            codesign --verify --deep --strict -vv /Applications/Bellows.app 2>&1 || true
+            codesign --verify --deep --strict /Applications/Bellows.app 2>&1 && echo "valid" || true
             echo "\$ codesign -dv"
             codesign -dv /Applications/Bellows.app 2>&1 | grep -E 'Signature|TeamIdentifier|flags' || true
             echo "\$ spctl --assess (what a double-click decides)"
@@ -83,33 +106,24 @@ jobs:
           # What "Open Anyway" in Privacy & Security amounts to.
           xattr -dr com.apple.quarantine /Applications/Bellows.app
 
-      - name: Launch ${{ inputs.version }}
+      - name: ${{ inputs.version }} opens
+        if: always()
         run: |
-          mkdir -p out
           /Applications/Bellows.app/Contents/MacOS/Bellows --remote-debugging-port=9222 > out/mac-app.log 2>&1 &
-          echo $! > app.pid
           node .github/smoke/probe.mjs --label mac --out out --version "$V" --update current --update-wait 60
-      - name: Screen
-        if: always()
-        run: screencapture -x out/mac-screen.png || true
       - name: Quit
         if: always()
-        run: kill "$(cat app.pid)" 2>/dev/null || true; sleep 3; pkill -f /Applications/Bellows.app || true; sleep 2
-
-      - name: ${{ inputs.from_version }} offers ${{ inputs.version }}
         run: |
-          rm -rf /Applications/Bellows.app
-          curl -fsSL -o old.dmg "$REL/v$FROM/Bellows-$FROM-arm64.dmg"
-          mnt=$(hdiutil attach -nobrowse -noautoopen old.dmg | awk -F'\t' '/\/Volumes\//{print $NF}')
-          cp -R "$mnt/Bellows.app" /Applications/
-          hdiutil detach "$mnt" -quiet
-          /Applications/Bellows.app/Contents/MacOS/Bellows --remote-debugging-port=9222 > out/mac-update-app.log 2>&1 &
-          echo $! > app.pid
-          node .github/smoke/probe.mjs --label mac-update --out out --version "$FROM" --update available --update-wait 90
-          node -e "const r=require('./out/mac-update.json'); if (r.update?.info?.version !== process.env.V) { console.log('offered', r.update?.info?.version, 'expected', process.env.V); process.exit(1) }"
-      - name: Quit
+          screencapture -x out/mac-screen.png || true
+          pkill -f /Applications/Bellows.app || true
+
+      - name: Crash reports
         if: always()
-        run: kill "$(cat app.pid)" 2>/dev/null || true; pkill -f /Applications/Bellows.app || true
+        run: |
+          mkdir -p out/crash
+          find ~/Library/Logs/DiagnosticReports /Library/Logs/DiagnosticReports -iname '*bellows*' -newer old.dmg -exec cp {} out/crash/ \; 2>/dev/null || true
+          ls -l out/crash
+          log show --last 30m --style compact --predicate 'eventMessage CONTAINS[c] "bellows" AND (eventMessage CONTAINS[c] "kill" OR eventMessage CONTAINS[c] "signature" OR eventMessage CONTAINS[c] "denied")' 2>/dev/null | tail -40 | tee out/crash/system-log.txt || true
 
       - uses: actions/upload-artifact@v7
         if: always()
@@ -166,7 +180,7 @@ jobs:
         run: pkill -f /opt/Bellows/bellows || true
 
       - name: Fail if the package missed a dependency
-        if: steps.deps.outcome == 'failure'
+        if: always() && steps.deps.outcome == 'failure'
         run: echo "::error::The .deb installs on a bare Ubuntu 24.04 without every library it needs (see the dependencies step)"; exit 1
 
       - uses: actions/upload-artifact@v7
@@ -248,7 +262,7 @@ jobs:
         run: pkill -f '\.AppImage' || true; pkill -f '/tmp/\.mount_' || true
 
       - name: Fail if the plain launch failed
-        if: steps.plain.outcome == 'failure'
+        if: always() && steps.plain.outcome == 'failure'
         run: echo "::error::The AppImage does not open as downloaded on Ubuntu 24.04 desktop settings (see the first launch's app log)"; exit 1
 
       - uses: actions/upload-artifact@v7
