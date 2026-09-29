@@ -57,18 +57,23 @@ while (!target && Date.now() < appearBy) {
 if (!check('window appeared', !!target, target ? undefined : 'no page on the DevTools port within 90s')) finish();
 
 const ws = new WebSocket(target.webSocketDebuggerUrl);
-await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = () => reject(new Error('DevTools socket failed')); });
+// Every wait is bounded: one DevTools call that never answers must fail a
+// check, not hang the job until GitHub's six-hour limit.
+const within = (ms, what, p) => Promise.race([p, sleep(ms).then(() => { throw new Error(`${what}: no answer in ${ms / 1000}s`); })]);
+try {
+  await within(15_000, 'DevTools socket', new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = () => reject(new Error('DevTools socket failed')); }));
+} catch (e) { check('DevTools connected', false, e.message); finish(); }
 let seq = 0;
 const pending = new Map();
 ws.onmessage = (m) => {
   const msg = JSON.parse(m.data);
   if (msg.id && pending.has(msg.id)) { pending.get(msg.id)(msg); pending.delete(msg.id); }
 };
-const send = (method, params = {}) => new Promise((resolve) => {
+const send = (method, params = {}) => within(15_000, method, new Promise((resolve) => {
   const id = ++seq;
   pending.set(id, resolve);
   ws.send(JSON.stringify({ id, method, params }));
-});
+}));
 const evaluate = async (expression) => {
   const r = await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true });
   if (r.error) throw new Error(r.error.message);
@@ -125,7 +130,7 @@ check('no errors logged', !errors || errors.length === 0, errors && errors.lengt
 
 // 5. Optionally, take the update. The app quits here, so this is last.
 if (install && result.checks.every((c) => c.ok)) {
-  send('Runtime.evaluate', { expression: 'window.cs.updates.install()' });
+  send('Runtime.evaluate', { expression: 'window.cs.updates.install()' }).catch(() => {});
   await sleep(1500);
   check('install requested', true);
 }
