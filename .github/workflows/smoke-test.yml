@@ -48,6 +48,7 @@ env:
 
 jobs:
   mac:
+    timeout-minutes: 30
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -115,6 +116,7 @@ jobs:
         with: { name: smoke-mac, path: out, retention-days: 14 }
 
   deb:
+    timeout-minutes: 30
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -130,13 +132,15 @@ jobs:
           sudo apt-get install -y -qq xvfb > /dev/null
 
       - name: Dependencies resolve on a bare Ubuntu 24.04
+        id: deps
+        continue-on-error: true
         run: |
           curl -fsSL -o bellows.deb "$REL/v$V/bellows_${V}_amd64.deb"
           dpkg-deb -f bellows.deb Depends
           docker run --rm -v "$PWD:/w" ubuntu:24.04 bash -c '
             apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq /w/bellows.deb > /tmp/apt.log 2>&1 || { tail -30 /tmp/apt.log; exit 1; }
             missing=$(ldd /opt/Bellows/bellows | grep "not found" || true)
-            if [ -n "$missing" ]; then echo "libraries the package does not pull in:"; echo "$missing"; exit 1; fi
+            if [ -n "$missing" ]; then echo "::error::libraries the package does not pull in:"; echo "$missing"; exit 1; fi
             echo "installed cleanly; every library resolves"'
 
       - name: Install ${{ inputs.version }} and launch
@@ -161,11 +165,16 @@ jobs:
         if: always()
         run: pkill -f /opt/Bellows/bellows || true
 
+      - name: Fail if the package missed a dependency
+        if: steps.deps.outcome == 'failure'
+        run: echo "::error::The .deb installs on a bare Ubuntu 24.04 without every library it needs (see the dependencies step)"; exit 1
+
       - uses: actions/upload-artifact@v7
         if: always()
         with: { name: smoke-deb, path: out, retention-days: 14 }
 
   appimage:
+    timeout-minutes: 30
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -193,8 +202,19 @@ jobs:
         if: always()
         run: pkill -f '\.AppImage' || true; pkill -f '/tmp/\.mount_' || true; sleep 3
 
-      - name: If that failed, is it the sandbox?
-        if: steps.plain.outcome == 'failure'
+      - name: With libfuse2 installed, as a user would be told to
+        id: fuse
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y -qq libfuse2t64 > /dev/null
+          xvfb-run -a -s "-screen 0 1440x900x24" "app/Bellows-$V.AppImage" --remote-debugging-port=9222 > out/appimage-fuse-app.log 2>&1 &
+          node .github/smoke/probe.mjs --label appimage-fuse --out out --version "$V" --update current --update-wait 60 || { echo "--- app log"; cat out/appimage-fuse-app.log; exit 1; }
+      - name: Quit
+        if: always()
+        run: pkill -f '\.AppImage' || true; pkill -f '/tmp/\.mount_' || true; sleep 3
+
+      - name: If that failed too, is it the sandbox?
+        if: steps.fuse.outcome == 'failure'
         run: |
           xvfb-run -a -s "-screen 0 1440x900x24" "app/Bellows-$V.AppImage" --no-sandbox --remote-debugging-port=9222 > out/appimage-nosandbox-app.log 2>&1 &
           if node .github/smoke/probe.mjs --label appimage-nosandbox --out out --version "$V"; then
@@ -209,7 +229,7 @@ jobs:
           curl -fsSL -o "app/Bellows-$FROM.AppImage" "$REL/v$FROM/Bellows-$FROM.AppImage"
           chmod +x "app/Bellows-$FROM.AppImage"
           # Same flags as whichever launch worked above, so the update is what is under test.
-          flags=""; [ "${{ steps.plain.outcome }}" = failure ] && flags="--no-sandbox"
+          flags=""; [ "${{ steps.fuse.outcome }}" = failure ] && flags="--no-sandbox"
           xvfb-run -a -s "-screen 0 1440x900x24" "app/Bellows-$FROM.AppImage" $flags --remote-debugging-port=9222 > out/appimage-update-app.log 2>&1 &
           node .github/smoke/probe.mjs --label appimage-update --out out --version "$FROM" --update ready --update-wait 300 --install || { echo "--- app log"; tail -40 out/appimage-update-app.log; exit 1; }
           # quitAndInstall replaces the file and relaunches it; give it time, then stop the relaunch.
@@ -229,7 +249,7 @@ jobs:
 
       - name: Fail if the plain launch failed
         if: steps.plain.outcome == 'failure'
-        run: echo "::error::The AppImage does not open as downloaded on Ubuntu 24.04 desktop settings"; exit 1
+        run: echo "::error::The AppImage does not open as downloaded on Ubuntu 24.04 desktop settings (see the first launch's app log)"; exit 1
 
       - uses: actions/upload-artifact@v7
         if: always()
