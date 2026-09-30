@@ -214,7 +214,7 @@ jobs:
           node .github/smoke/probe.mjs --label appimage --out out --version "$V" --update current --update-wait 60 || { echo "--- app log"; cat out/appimage-app.log; exit 1; }
       - name: Quit
         if: always()
-        run: pkill -f '\.AppImage' || true; pkill -f '/tmp/\.mount_' || true; sleep 3; echo '--- still running after quit:'; ps -eo pid,ppid,etimes,args | grep -E 'mount_|claude|Bellows|bellows' | grep -v grep || echo none; ss -ltnp 2>/dev/null | grep ':9222' || echo 'port 9222 free'
+        run: pkill -f '/tmp/\.mount_' || true; sleep 3; pkill -f '\.AppImage' || true; sleep 3; echo '--- still running after quit:'; ps -eo pid,ppid,etimes,args | grep -E 'mount_|claude|Bellows|bellows' | grep -v grep || echo none; ss -ltnp 2>/dev/null | grep ':9222' || echo 'port 9222 free'
 
       - name: With libfuse2 installed, as a user would be told to
         id: fuse
@@ -225,7 +225,7 @@ jobs:
           node .github/smoke/probe.mjs --label appimage-fuse --out out --version "$V" --update current --update-wait 60 || { echo "--- app log"; cat out/appimage-fuse-app.log; exit 1; }
       - name: Quit
         if: always()
-        run: pkill -f '\.AppImage' || true; pkill -f '/tmp/\.mount_' || true; sleep 3; echo '--- still running after quit:'; ps -eo pid,ppid,etimes,args | grep -E 'mount_|claude|Bellows|bellows' | grep -v grep || echo none; ss -ltnp 2>/dev/null | grep ':9222' || echo 'port 9222 free'
+        run: pkill -f '/tmp/\.mount_' || true; sleep 3; pkill -f '\.AppImage' || true; sleep 3; echo '--- still running after quit:'; ps -eo pid,ppid,etimes,args | grep -E 'mount_|claude|Bellows|bellows' | grep -v grep || echo none; ss -ltnp 2>/dev/null | grep ':9222' || echo 'port 9222 free'
 
       - name: If that failed too, is it the sandbox?
         if: steps.fuse.outcome == 'failure'
@@ -234,7 +234,7 @@ jobs:
           if node .github/smoke/probe.mjs --label appimage-nosandbox --out out --version "$V"; then
             echo "AppImage opens only with --no-sandbox on Ubuntu 24.04 desktop settings" | tee -a "$GITHUB_STEP_SUMMARY"
           fi
-          pkill -f '\.AppImage' || true; pkill -f '/tmp/\.mount_' || true; sleep 3
+          pkill -f '/tmp/\.mount_' || true; sleep 3; pkill -f '\.AppImage' || true; sleep 3
 
       - name: ${{ inputs.from_version }} updates itself to ${{ inputs.version }}
         id: update
@@ -248,7 +248,7 @@ jobs:
           node .github/smoke/probe.mjs --label appimage-update --out out --version "$FROM" --update ready --update-wait 300 --install || { echo "--- app log"; tail -40 out/appimage-update-app.log; exit 1; }
           # quitAndInstall replaces the file and relaunches it; give it time, then stop the relaunch.
           sleep 25
-          pkill -f '\.AppImage' || true; pkill -f '/tmp/\.mount_' || true; sleep 3
+          pkill -f '/tmp/\.mount_' || true; sleep 3; pkill -f '\.AppImage' || true; sleep 3
           ls -l app
           echo "flags=$flags" >> "$GITHUB_OUTPUT"
       - name: The updated copy is ${{ inputs.version }}
@@ -259,7 +259,7 @@ jobs:
           node .github/smoke/probe.mjs --label appimage-updated --out out --version "$V" || { echo "--- app log"; cat out/appimage-updated-app.log; exit 1; }
       - name: Quit
         if: always()
-        run: pkill -f '\.AppImage' || true; pkill -f '/tmp/\.mount_' || true
+        run: pkill -f '/tmp/\.mount_' || true; sleep 3; pkill -f '\.AppImage' || true
 
       - name: Fail if the plain launch failed
         if: always() && steps.plain.outcome == 'failure'
