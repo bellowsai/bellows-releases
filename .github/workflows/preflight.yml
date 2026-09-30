@@ -1,0 +1,285 @@
+# Source of truth for .github/workflows/preflight.yml in bellowsai/bellows-releases.
+#
+# Kept here, outside .github/workflows, like build-unix.yml and smoke-test.yml.
+# Change it here, then copy it over.
+#
+# ---------------------------------------------------------------------------
+#
+# The smoke test, BEFORE a release. Builds a source commit for macOS and Linux
+# exactly as build-unix.yml builds a release (tests, Developer ID signing and
+# notarisation), then installs each build on a clean machine the way a user
+# would, launches it and looks at it with smoke/probe.mjs -- the same checks
+# smoke-test.yml makes of a published release.
+#
+# 1.11.12 went out unable to start Claude on any platform, and every test passed:
+# they run from source, and only a packaged copy spawns the CLI out of app.asar.
+# The smoke test found it after users had it. This finds that class of fault
+# while it is still a commit.
+#
+# Started by `npm run preflight`, which pushes the commit to the source repo's
+# `preflight` branch and dispatches this with its sha. `npm run ship` refuses a
+# commit without a successful run, found by the run name below.
+#
+# WHAT IT CANNOT CHECK. Updating: an unreleased build has no feed to update
+# from or to. smoke-test.yml still covers that, on the published release.
+#
+# WHAT IS PUBLIC. This file, probe.mjs and the logs. Secrets as build-unix.yml;
+# nothing prints them. The builds are uploaded as artifacts (kept 3 days), never
+# attached to a release: nothing here reaches a user.
+name: preflight
+run-name: preflight ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Full sha of the bellowsai/bellows commit to build
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preflight-${{ inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: mac
+          - os: ubuntu-latest
+            platform: linux
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - name: The ref is a full commit sha
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          case "$REF" in *[!0-9a-f]*|"") echo "::error::not a commit sha: '$REF'"; exit 1 ;; esac
+          [ ${#REF} -eq 40 ] || { echo "::error::give the full 40-character sha"; exit 1; }
+
+      - name: The source token works
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: |
+          if [ -z "$SOURCE_TOKEN" ]; then echo "::error::SOURCE_TOKEN is empty on this repository"; exit 1; fi
+          code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $SOURCE_TOKEN" -H "Accept: application/vnd.github+json" https://api.github.com/repos/bellowsai/bellows)
+          [ "$code" = 200 ] || { echo "::error::SOURCE_TOKEN cannot read bellowsai/bellows (HTTP $code)"; exit 1; }
+
+      - uses: actions/checkout@v7
+        with:
+          repository: bellowsai/bellows
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: source
+          persist-credentials: false
+
+      - name: Version
+        id: v
+        run: echo "version=$(node -p "require('./source/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+
+      - name: Install
+        working-directory: source
+        run: npm ci
+
+      - name: Tests
+        working-directory: source
+        run: npm test
+
+      # Identical to build-unix.yml's step of the same name; see the comments
+      # there. An unsigned arm64 app does not open, so there is no cheaper build
+      # that would test the same thing.
+      - name: Signing and notarisation credentials
+        if: matrix.platform == 'mac'
+        env:
+          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          missing=""
+          for n in MAC_CERT_P12 MAC_CERT_PASSWORD APPLE_API_KEY_P8 APPLE_API_KEY_ID APPLE_API_ISSUER; do
+            [ -n "${!n}" ] || missing="$missing $n"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing secrets on this repository:$missing. See docs/RELEASING.md, 'macOS signing'."
+            exit 1
+          fi
+          MAC_CERT_PASSWORD=$(printf '%s' "$MAC_CERT_PASSWORD" | tr -d '\r\n')
+          APPLE_API_KEY_ID=$(printf '%s' "$APPLE_API_KEY_ID" | tr -d '\r\n ')
+          APPLE_API_ISSUER=$(printf '%s' "$APPLE_API_ISSUER" | tr -d '\r\n ')
+          MAC_CERT_P12=$(printf '%s' "$MAC_CERT_P12" | tr -d '\r\n ')
+          key="$RUNNER_TEMP/apple-api-key.p8"
+          printf '%s\n' "$APPLE_API_KEY_P8" > "$key"
+          kc="$RUNNER_TEMP/signing.keychain-db"
+          kcpw=$(openssl rand -hex 24)
+          security create-keychain -p "$kcpw" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$kcpw" "$kc"
+          p12="$RUNNER_TEMP/developer-id.p12"
+          printf '%s' "$MAC_CERT_P12" | base64 --decode > "$p12"
+          security import "$p12" -k "$kc" -P "$MAC_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productbuild
+          rm -f "$p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$kcpw" "$kc" > /dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          name=$(security find-identity -v -p codesigning "$kc" | sed -n 's/.*"Developer ID Application: \(.*\)"/\1/p' | head -1)
+          if [ -z "$name" ]; then
+            echo "::error::no Developer ID Application identity in MAC_CERT_P12"
+            exit 1
+          fi
+          {
+            echo "CSC_KEYCHAIN=$kc"
+            echo "CSC_NAME=$name"
+            echo "APPLE_API_KEY=$key"
+            echo "APPLE_API_KEY_ID=$APPLE_API_KEY_ID"
+            echo "APPLE_API_ISSUER=$APPLE_API_ISSUER"
+          } >> "$GITHUB_ENV"
+
+      - name: Package
+        working-directory: source
+        run: npm run stamp && npx electron-builder --${{ matrix.platform }} --publish never
+
+      - name: Signed by the Developer ID, notarised, and Gatekeeper opens it
+        if: matrix.platform == 'mac'
+        working-directory: source
+        run: |
+          app=$(ls -d dist/mac-arm64/*.app | head -1)
+          codesign --verify --deep --strict "$app"
+          if codesign -dv "$app" 2>&1 | grep -q 'Signature=adhoc'; then echo "::error::the app is ad-hoc signed"; exit 1; fi
+          xcrun stapler validate "$app"
+          spctl --assess --type exec -vv "$app"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-${{ matrix.platform }}
+          path: |
+            source/dist/*.dmg
+            source/dist/*.AppImage
+            source/dist/*.deb
+          if-no-files-found: error
+          retention-days: 3
+
+  mac:
+    needs: build
+    timeout-minutes: 30
+    runs-on: macos-latest
+    env:
+      V: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with: { node-version: 24 }
+      - uses: actions/download-artifact@v7
+        with: { name: build-mac, path: build }
+      - name: Install from the dmg
+        run: |
+          mkdir -p out
+          dmg=$(ls build/*.dmg | head -1)
+          mnt=$(hdiutil attach -nobrowse -noautoopen "$dmg" | awk -F'	' '/\/Volumes\//{print $NF}')
+          cp -R "$mnt/Bellows.app" /Applications/
+          hdiutil detach "$mnt" -quiet
+      - name: Gatekeeper on a downloaded copy
+        run: |
+          xattr -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");Safari;$(uuidgen)" /Applications/Bellows.app
+          spctl --assess -vv --type exec /Applications/Bellows.app 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          xattr -dr com.apple.quarantine /Applications/Bellows.app
+      - name: Opens
+        run: |
+          /Applications/Bellows.app/Contents/MacOS/Bellows --remote-debugging-port=9222 > out/mac-app.log 2>&1 &
+          node .github/smoke/probe.mjs --label mac --out out --version "$V" || { echo "--- app log"; cat out/mac-app.log; exit 1; }
+      - name: Quit
+        if: always()
+        run: |
+          screencapture -x out/mac-screen.png || true
+          pkill -f /Applications/Bellows.app || true; sleep 3
+          echo '--- still running after quit:'; ps -eo pid,ppid,etime,args | grep -E 'claude|Bellows' | grep -v grep || echo none
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with: { name: smoke-mac, path: out, retention-days: 14 }
+
+  deb:
+    needs: build
+    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    env:
+      V: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with: { node-version: 24 }
+      - uses: actions/download-artifact@v7
+        with: { name: build-linux, path: build }
+      - name: Desktop conditions
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb > /dev/null
+          cp "$(ls build/*.deb | head -1)" bellows.deb
+      - name: Dependencies resolve on a bare Ubuntu 24.04
+        run: |
+          dpkg-deb -f bellows.deb Depends
+          docker run --rm -v "$PWD:/w" ubuntu:24.04 bash -c '
+            apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq /w/bellows.deb > /tmp/apt.log 2>&1 || { tail -30 /tmp/apt.log; exit 1; }
+            missing=$(ldd /opt/Bellows/bellows | grep "not found" || true)
+            if [ -n "$missing" ]; then echo "::error::libraries the package does not pull in:"; echo "$missing"; exit 1; fi
+            echo "installed cleanly; every library resolves"'
+      - name: Install and launch
+        run: |
+          mkdir -p out
+          sudo apt-get install -y -qq ./bellows.deb > /dev/null
+          xvfb-run -a -s "-screen 0 1440x900x24" bellows --remote-debugging-port=9222 > out/deb-app.log 2>&1 &
+          node .github/smoke/probe.mjs --label deb --out out --version "$V" || { echo "--- app log"; cat out/deb-app.log; exit 1; }
+      - name: Quit
+        if: always()
+        run: pkill -f /opt/Bellows/bellows || true; sleep 3; echo '--- still running after quit:'; ps -eo pid,ppid,etimes,args | grep -E 'mount_|claude|Bellows|bellows' | grep -v grep || echo none; ss -ltnp 2>/dev/null | grep ':9222' || echo 'port 9222 free'
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with: { name: smoke-deb, path: out, retention-days: 14 }
+
+  appimage:
+    needs: build
+    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    env:
+      V: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with: { node-version: 24 }
+      - uses: actions/download-artifact@v7
+        with: { name: build-linux, path: build }
+      - name: Desktop conditions
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb > /dev/null
+          if ldconfig -p | grep -q 'libfuse\.so\.2'; then echo "libfuse2: present"; else echo "libfuse2: ABSENT"; fi | tee -a "$GITHUB_STEP_SUMMARY"
+      # As downloaded: no libfuse2, the desktop's AppArmor setting, no flags.
+      # The release notes promise exactly this, so it must pass.
+      - name: Launch as downloaded
+        run: |
+          mkdir -p out app
+          cp "$(ls build/*.AppImage | head -1)" "app/Bellows-$V.AppImage"
+          chmod +x "app/Bellows-$V.AppImage"
+          xvfb-run -a -s "-screen 0 1440x900x24" "app/Bellows-$V.AppImage" --remote-debugging-port=9222 > out/appimage-app.log 2>&1 &
+          node .github/smoke/probe.mjs --label appimage --out out --version "$V" || { echo "--- app log"; cat out/appimage-app.log; exit 1; }
+      - name: Quit
+        if: always()
+        run: pkill -f '/tmp/\.mount_' || true; sleep 3; pkill -f '\.AppImage' || true; sleep 3; echo '--- still running after quit:'; ps -eo pid,ppid,etimes,args | grep -E 'mount_|claude|Bellows|bellows' | grep -v grep || echo none; ss -ltnp 2>/dev/null | grep ':9222' || echo 'port 9222 free'
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with: { name: smoke-appimage, path: out, retention-days: 14 }
