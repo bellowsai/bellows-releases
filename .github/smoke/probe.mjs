@@ -30,6 +30,7 @@ const wantUpdate = opt('update', null);
 const updateWait = Number(opt('update-wait', 240)) * 1000;
 const install = opt('install', false) === true;
 
+const probeStarted = Date.now();
 fs.mkdirSync(out, { recursive: true });
 const result = { label, ok: false, checks: [] };
 const check = (name, ok, detail) => {
@@ -124,8 +125,17 @@ if (wantUpdate) {
 }
 
 // 4. Nothing logged as an error on the way.
-const errors = await evaluate('window.cs.errors.list()').catch((e) => [{ message: 'could not read: ' + e.message }]);
+// The log lives on disk and outlives the app, so it still holds what the
+// previous launch wrote as the workflow pkill'd it ("Renderer gone: killed",
+// "clean-exit"). Count only this launch's: anything from before this window
+// loaded, less 10s for the main process starting up, is not.
+const all = await evaluate('window.cs.errors.list()').catch((e) => [{ at: new Date().toISOString(), message: 'could not read: ' + e.message }]);
+const loaded = Number(await evaluate('performance.timeOrigin').catch(() => 0)) || Date.now();
+const since = loaded - 10000;
+const errors = (all || []).filter((e) => !e.at || Date.parse(e.at) >= since);
 result.errors = errors;
+result.earlierErrors = (all || []).filter((e) => !errors.includes(e));
+if (result.earlierErrors.length) console.log(`note  ${result.earlierErrors.length} error(s) from an earlier launch ignored`, JSON.stringify(result.earlierErrors.map((e) => `${e.version}: ${e.message}`)));
 check('no errors logged', !errors || errors.length === 0, errors && errors.length ? errors.map((e) => e.message).slice(0, 5) : undefined);
 
 // 5. Optionally, take the update. The app quits here, so this is last.
