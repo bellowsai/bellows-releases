@@ -1,0 +1,104 @@
+# Source of truth for .github/workflows/appimage-test.yml in bellowsai/bellows-releases.
+# Change it here, then copy it over with the contents API (as for probe.mjs).
+#
+# Builds the Linux AppImage from a source commit WITHOUT publishing anything,
+# and checks it opens on a clean Ubuntu 24.04 desktop that has no libfuse2.
+#
+# Why: the legacy AppImage runtime loads libfuse.so.2, which Ubuntu 22.04+
+# does not ship, so the AppImage did not open as downloaded (finding 3 in
+# HANDOVER.md). electron-builder's newer toolset uses the static
+# type2-runtime, which does not need it. This tries a toolset before a release
+# carries it, because AppImage copies update themselves and a broken one
+# would replace working installs.
+#
+# The AppImage itself is not uploaded: only the probe's results, screenshots
+# and app logs.
+name: appimage-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Source branch or commit to build
+        default: main
+        required: true
+      toolset:
+        description: electron-builder appimage toolset (0.0.0 is the legacy libfuse2 runtime)
+        default: "1.0.3"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  appimage:
+    timeout-minutes: 40
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Inputs
+        env:
+          REF: ${{ inputs.ref }}
+          TOOLSET: ${{ inputs.toolset }}
+        run: |
+          case "$REF" in ""|*[!A-Za-z0-9._/-]*) echo "::error::not a ref: '$REF'"; exit 1 ;; esac
+          case "$TOOLSET" in 0.0.0|1.0.2|1.0.3) ;; *) echo "::error::unknown toolset: '$TOOLSET'"; exit 1 ;; esac
+
+      - uses: actions/checkout@v7
+
+      - uses: actions/checkout@v7
+        with:
+          repository: bellowsai/bellows
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: source
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+
+      - name: Build the AppImage (not published)
+        working-directory: source
+        env:
+          TOOLSET: ${{ inputs.toolset }}
+        run: |
+          npm ci
+          npm run stamp
+          npx electron-builder --linux AppImage --publish never -c.toolsets.appimage="$TOOLSET"
+          ls -l dist/*.AppImage
+
+      - name: Desktop conditions, without libfuse2
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb > /dev/null
+          # Make sure it is really absent, as on a fresh desktop.
+          sudo apt-get remove -y -qq libfuse2t64 libfuse2 > /dev/null 2>&1 || true
+          if ldconfig -p | grep -q 'libfuse\.so\.2'; then echo "::error::libfuse2 still present"; exit 1; fi
+          echo "libfuse2: ABSENT" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "fusermount3: $(command -v fusermount3 || echo ABSENT)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Opens as downloaded (no libfuse2, sandbox on)
+        env:
+          TOOLSET: ${{ inputs.toolset }}
+        run: |
+          mkdir -p out
+          img=$(ls source/dist/*.AppImage | head -1)
+          v=$(node -p "require('./source/package.json').version")
+          chmod +x "$img"
+          xvfb-run -a -s "-screen 0 1440x900x24" "$img" --remote-debugging-port=9222 > out/appimage-app.log 2>&1 &
+          node .github/smoke/probe.mjs --label appimage-static --out out --version "$v" --update current --update-wait 60 \
+            || { echo "--- app log"; cat out/appimage-app.log; exit 1; }
+          echo "toolset $TOOLSET: opens without libfuse2" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Quit
+        if: always()
+        run: pkill -f '\.AppImage' || true; pkill -f '/tmp/\.mount_' || true
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: appimage-test
+          path: out
+          retention-days: 7
