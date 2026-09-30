@@ -128,10 +128,11 @@ if (wantUpdate) {
 // The log lives on disk and outlives the app, so it still holds what the
 // previous launch wrote as the workflow pkill'd it ("Renderer gone: killed",
 // "clean-exit"). Count only this launch's: anything from before this window
-// loaded, less 10s for the main process starting up, is not.
+// loaded, less 3s for the main process starting up, is not. Not more: the
+// quit steps leave only ~6s between killing one launch and starting the next.
 const all = await evaluate('window.cs.errors.list()').catch((e) => [{ at: new Date().toISOString(), message: 'could not read: ' + e.message }]);
 const loaded = Number(await evaluate('performance.timeOrigin').catch(() => 0)) || Date.now();
-const since = loaded - 10000;
+const since = loaded - 3000;
 const errors = (all || []).filter((e) => !e.at || Date.parse(e.at) >= since);
 result.errors = errors;
 result.earlierErrors = (all || []).filter((e) => !errors.includes(e));
