@@ -204,6 +204,14 @@ jobs:
             echo "APPLE_API_ISSUER=$APPLE_API_ISSUER"
           } >> "$GITHUB_ENV"
 
+      # The runner is Apple silicon, so npm installed only the arm64 Claude
+      # binary. The Intel build needs its own; electron-builder.json keeps each
+      # build to its own architecture's copy.
+      - name: Claude binary for the Intel build
+        if: matrix.platform == 'mac'
+        working-directory: source
+        run: node scripts/sdk-for-arch.js darwin-x64
+
       - name: Package
         working-directory: source
         run: npm run stamp && npx electron-builder --${{ matrix.platform }} --publish never
@@ -212,14 +220,28 @@ jobs:
         if: matrix.platform == 'mac'
         working-directory: source
         run: |
-          app=$(ls -d dist/mac-arm64/*.app | head -1)
-          codesign --verify --deep --strict "$app"
-          codesign -dv "$app" 2>&1 | grep -E '^(Authority|TeamIdentifier)=' | head -3
-          if codesign -dv "$app" 2>&1 | grep -q 'Signature=adhoc'; then echo "::error::the app is ad-hoc signed"; exit 1; fi
-          xcrun stapler validate "$app"
-          spctl --assess --type exec -vv "$app"
-          dmg=$(ls dist/*.dmg | head -1)
-          spctl --assess --type open --context context:primary-signature -vv "$dmg" || echo "::warning::the dmg itself is not notarised; the app inside is"
+          # dist/mac-arm64 is Apple silicon, dist/mac is Intel.
+          for dir in mac-arm64:arm64 mac:x86_64; do
+            app=$(ls -d dist/${dir%%:*}/*.app | head -1)
+            want=${dir##*:}
+            echo "== $app"
+            codesign --verify --deep --strict "$app"
+            codesign -dv "$app" 2>&1 | grep -E '^(Authority|TeamIdentifier)=' | head -3
+            if codesign -dv "$app" 2>&1 | grep -q 'Signature=adhoc'; then echo "::error::the app is ad-hoc signed"; exit 1; fi
+            xcrun stapler validate "$app"
+            spctl --assess --type exec -vv "$app"
+            got=$(lipo -archs "$app/Contents/MacOS/Bellows")
+            [ "$got" = "$want" ] || { echo "::error::$app is $got, expected $want"; exit 1; }
+            # Claude in this copy: the binary for this architecture, and only it.
+            sdk=$(ls -d "$app"/Contents/Resources/app.asar.unpacked/node_modules/@anthropic-ai/claude-agent-sdk-darwin-* )
+            [ $(echo "$sdk" | wc -l) -eq 1 ] || { echo "::error::$app carries more than one Claude binary: $sdk"; exit 1; }
+            got=$(lipo -archs "$sdk/claude")
+            [ "$got" = "$want" ] || { echo "::error::$sdk/claude is $got, expected $want"; exit 1; }
+          done
+          for dmg in dist/*.dmg; do
+            spctl --assess --type open --context context:primary-signature -vv "$dmg" || echo "::warning::$dmg itself is not notarised; the app inside is"
+          done
+          ls dist/*-arm64.dmg dist/*-x64.dmg
 
       - name: Sign the update manifest
         working-directory: source
