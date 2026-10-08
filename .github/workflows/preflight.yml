@@ -234,7 +234,7 @@ jobs:
           echo '--- still running after quit:'; ps -eo pid,ppid,etime,args | grep -E 'claude|Bellows' | grep -v grep || echo none
       - uses: actions/upload-artifact@v7
         if: always()
-        with: { name: smoke-${{ matrix.label }}, path: out, retention-days: 14 }
+        with: { name: "smoke-${{ matrix.label }}", path: out, retention-days: 14 }
 
   deb:
     needs: build
