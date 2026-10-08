@@ -149,6 +149,13 @@ jobs:
             echo "APPLE_API_ISSUER=$APPLE_API_ISSUER"
           } >> "$GITHUB_ENV"
 
+      # Apple silicon runner: npm installed only the arm64 Claude binary. The
+      # Intel build needs its own (same as build-unix.yml).
+      - name: Claude binary for the Intel build
+        if: matrix.platform == 'mac'
+        working-directory: source
+        run: node scripts/sdk-for-arch.js darwin-x64
+
       - name: Package
         working-directory: source
         run: npm run stamp && npx electron-builder --${{ matrix.platform }} --publish never
@@ -157,11 +164,18 @@ jobs:
         if: matrix.platform == 'mac'
         working-directory: source
         run: |
-          app=$(ls -d dist/mac-arm64/*.app | head -1)
-          codesign --verify --deep --strict "$app"
-          if codesign -dv "$app" 2>&1 | grep -q 'Signature=adhoc'; then echo "::error::the app is ad-hoc signed"; exit 1; fi
-          xcrun stapler validate "$app"
-          spctl --assess --type exec -vv "$app"
+          for dir in mac-arm64:arm64 mac:x86_64; do
+            app=$(ls -d dist/${dir%%:*}/*.app | head -1)
+            want=${dir##*:}
+            codesign --verify --deep --strict "$app"
+            if codesign -dv "$app" 2>&1 | grep -q 'Signature=adhoc'; then echo "::error::the app is ad-hoc signed"; exit 1; fi
+            xcrun stapler validate "$app"
+            spctl --assess --type exec -vv "$app"
+            sdk=$(ls -d "$app"/Contents/Resources/app.asar.unpacked/node_modules/@anthropic-ai/claude-agent-sdk-darwin-* )
+            [ $(echo "$sdk" | wc -l) -eq 1 ] || { echo "::error::$app carries more than one Claude binary: $sdk"; exit 1; }
+            got=$(lipo -archs "$sdk/claude")
+            [ "$got" = "$want" ] || { echo "::error::$sdk/claude is $got, expected $want"; exit 1; }
+          done
 
       - uses: actions/upload-artifact@v7
         with:
@@ -173,10 +187,21 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+  # Each Mac build installed and opened on its own kind of Mac.
   mac:
     needs: build
     timeout-minutes: 30
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            arch: arm64
+            label: mac
+          - runner: macos-15-intel
+            arch: x64
+            label: mac-intel
+    runs-on: ${{ matrix.runner }}
     env:
       V: ${{ needs.build.outputs.version }}
     steps:
@@ -188,7 +213,7 @@ jobs:
       - name: Install from the dmg
         run: |
           mkdir -p out
-          dmg=$(ls build/*.dmg | head -1)
+          dmg=$(ls build/*-${{ matrix.arch }}.dmg | head -1)
           mnt=$(hdiutil attach -nobrowse -noautoopen "$dmg" | awk -F'	' '/\/Volumes\//{print $NF}')
           cp -R "$mnt/Bellows.app" /Applications/
           hdiutil detach "$mnt" -quiet
@@ -200,7 +225,7 @@ jobs:
       - name: Opens
         run: |
           /Applications/Bellows.app/Contents/MacOS/Bellows --remote-debugging-port=9222 > out/mac-app.log 2>&1 &
-          node .github/smoke/probe.mjs --label mac --out out --version "$V" || { echo "--- app log"; cat out/mac-app.log; exit 1; }
+          node .github/smoke/probe.mjs --label ${{ matrix.label }} --out out --version "$V" || { echo "--- app log"; cat out/mac-app.log; exit 1; }
       - name: Quit
         if: always()
         run: |
@@ -209,7 +234,7 @@ jobs:
           echo '--- still running after quit:'; ps -eo pid,ppid,etime,args | grep -E 'claude|Bellows' | grep -v grep || echo none
       - uses: actions/upload-artifact@v7
         if: always()
-        with: { name: smoke-mac, path: out, retention-days: 14 }
+        with: { name: smoke-${{ matrix.label }}, path: out, retention-days: 14 }
 
   deb:
     needs: build
