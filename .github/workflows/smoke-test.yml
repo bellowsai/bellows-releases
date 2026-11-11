@@ -152,6 +152,9 @@ jobs:
           curl -fsSL -o bellows.deb "$REL/v$V/bellows_${V}_amd64.deb"
           dpkg-deb -f bellows.deb Depends
           docker run --rm --network host -v "$PWD:/w" ubuntu:24.04 bash -c '
+            # The Azure mirror the runners use themselves: archive.ubuntu.com stopped resolving here on 11 Nov.
+            sed -i "s#http://\(archive\|security\)\.ubuntu\.com#http://azure.archive.ubuntu.com#g" /etc/apt/sources.list.d/ubuntu.sources
+            getent hosts azure.archive.ubuntu.com || echo "::warning::azure.archive.ubuntu.com does not resolve"
             apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq /w/bellows.deb > /tmp/apt.log 2>&1 || { tail -30 /tmp/apt.log; exit 1; }
             missing=$(ldd /opt/Bellows/bellows | grep "not found" || true)
             if [ -n "$missing" ]; then echo "::error::libraries the package does not pull in:"; echo "$missing"; exit 1; fi
